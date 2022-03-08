@@ -3383,10 +3383,14 @@ static const void *MP4D_read_vpsspspps(const MP4D_demux_t *mp4, unsigned int ntr
         return NULL;
     if ((mp4->track[ntrack].object_type_indication != MP4_OBJECT_TYPE_AVC)
             && (mp4->track[ntrack].object_type_indication != MP4_OBJECT_TYPE_HEVC))
-        return NULL;    // SPS/PPS are specific for AVC format only
+        return NULL;
 
     if (mp4->track[ntrack].object_type_indication == MP4_OBJECT_TYPE_HEVC)
         is_hevc = 1;
+
+    if ((!is_hevc) && (ps_type == 'v'))
+        return NULL;
+
     if ((ps_type == 's') || (ps_type == 'p'))
     {
         // Skip all VPS
