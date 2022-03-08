@@ -1,5 +1,8 @@
 .vscode
-minimp4_*
+minimp4_test
+minimp4_x86
+minimp4_arm_gcc
+minimp4_yi
 qemu-prof
 *.mp4
 *.gcda
