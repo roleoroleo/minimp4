@@ -2648,6 +2648,7 @@ int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buff
             //{BOX_svc1, BOX_ATOM},
 #endif
 #if MP4D_HEVC_SUPPORTED
+            {BOX_hev1, BOX_ATOM},
             {BOX_hvc1, BOX_ATOM},
 #endif
             {BOX_udta, BOX_ATOM},
@@ -3070,6 +3071,56 @@ broken_android_meta_hack:
             break;
 #endif  // MP4D_AVC_SUPPORTED
 
+#if MP4D_HEVC_SUPPORTED
+        case BOX_hev1:  // HEVCSampleEntry extends VisualSampleEntry
+//        case BOX_hvc1:  // HEVCSampleEntry extends VisualSampleEntry
+            if (!tr)
+            {
+                ERROR("broken file structure!");
+            }
+#if MP4D_INFO_SUPPORTED
+            SKIP(6*1 + 2/*Base SampleEntry*/ + 2 + 2 + 4*3);
+            tr->SampleDescription.video.width  = READ(2);
+            tr->SampleDescription.video.height = READ(2);
+            // frame_count is always 1
+            // compressorname is rarely set..
+            SKIP(4 + 4 + 4 + 2/*frame_count*/ + 32/*compressorname*/ + 2 + 2);
+#else
+            SKIP(78);
+#endif
+            break;
+
+        case BOX_hvcC:  // HEVCDecoderConfigurationRecord()
+            tr->object_type_indication = MP4_OBJECT_TYPE_HEVC;
+            tr->dsi = (unsigned char*)malloc((size_t)box_bytes);
+            tr->dsi_bytes = (unsigned)box_bytes;
+
+            {
+                int vpsspspps;
+                unsigned char *p = tr->dsi;
+                SKIP(23);
+
+                for (vpsspspps = 0; vpsspspps < 3; vpsspspps++)
+                {
+                    SKIP(1);
+                    unsigned int numOfParameterSets= READ(2);
+                    *p++ = numOfParameterSets >> 8;
+                    *p++ = numOfParameterSets;
+                    for (i = 0; i < numOfParameterSets; i++)
+                    {
+                        unsigned k, parameterSetLength = READ(2);
+                        *p++ = parameterSetLength >> 8;
+                        *p++ = parameterSetLength ;
+                        for (k = 0; k < parameterSetLength; k++)
+                        {
+                            *p++ = READ(1);
+                        }
+                    }
+                }
+            }
+            break;
+#endif
+
         case OD_ESD:
             {
                 unsigned flags = READ(3);   // ES_ID(2) + flags(1)
@@ -3308,7 +3359,7 @@ void MP4D_close(MP4D_demux_t *mp4)
 #endif
 }
 
-static int skip_spspps(const unsigned char *p, int nbytes, int nskip)
+static int skip_vpsspspps(const unsigned char *p, int nbytes, int nskip)
 {
     int i, k = 0;
     for (i = 0; i < nskip; i++)
@@ -3322,31 +3373,59 @@ static int skip_spspps(const unsigned char *p, int nbytes, int nskip)
     return k;
 }
 
-static const void *MP4D_read_spspps(const MP4D_demux_t *mp4, unsigned int ntrack, int pps_flag, int nsps, int *sps_bytes)
+static const void *MP4D_read_vpsspspps(const MP4D_demux_t *mp4, unsigned int ntrack, char ps_type, int nsps, int *sps_bytes)
 {
     int sps_count, skip_bytes;
     int bytepos = 0;
     unsigned char *p = mp4->track[ntrack].dsi;
+    int is_hevc = 0;
     if (ntrack >= mp4->track_count)
         return NULL;
-    if (mp4->track[ntrack].object_type_indication != MP4_OBJECT_TYPE_AVC)
+    if ((mp4->track[ntrack].object_type_indication != MP4_OBJECT_TYPE_AVC)
+            && (mp4->track[ntrack].object_type_indication != MP4_OBJECT_TYPE_HEVC))
         return NULL;    // SPS/PPS are specific for AVC format only
 
-    if (pps_flag)
+    if (mp4->track[ntrack].object_type_indication == MP4_OBJECT_TYPE_HEVC)
+        is_hevc = 1;
+    if ((ps_type == 's') || (ps_type == 'p'))
+    {
+        // Skip all VPS
+        if (is_hevc) {
+            sps_count = p[bytepos]*256 + p[bytepos+1];
+            bytepos+=2;
+
+            skip_bytes = skip_vpsspspps(p+bytepos, mp4->track[ntrack].dsi_bytes - bytepos, sps_count);
+            if (skip_bytes < 0)
+                return NULL;
+            bytepos += skip_bytes;
+        }
+    }
+
+    if (ps_type == 'p')
     {
         // Skip all SPS
-        sps_count = p[bytepos++];
-        skip_bytes = skip_spspps(p+bytepos, mp4->track[ntrack].dsi_bytes - bytepos, sps_count);
+        if (is_hevc) {
+            sps_count = p[bytepos]*256 + p[bytepos+1];
+            bytepos+=2;
+        } else {
+            sps_count = p[bytepos++];
+        }
+        skip_bytes = skip_vpsspspps(p+bytepos, mp4->track[ntrack].dsi_bytes - bytepos, sps_count);
         if (skip_bytes < 0)
             return NULL;
         bytepos += skip_bytes;
     }
 
     // Skip sps/pps before the given target
-    sps_count = p[bytepos++];
+    if (is_hevc) {
+        sps_count = p[bytepos]*256 + p[bytepos+1];
+        bytepos+=2;
+    } else {
+        sps_count = p[bytepos++];
+    }
     if (nsps >= sps_count)
         return NULL;
-    skip_bytes = skip_spspps(p+bytepos, mp4->track[ntrack].dsi_bytes - bytepos, nsps);
+    skip_bytes = skip_vpsspspps(p+bytepos, mp4->track[ntrack].dsi_bytes - bytepos, nsps);
     if (skip_bytes < 0)
         return NULL;
     bytepos += skip_bytes;
@@ -3355,14 +3434,19 @@ static const void *MP4D_read_spspps(const MP4D_demux_t *mp4, unsigned int ntrack
 }
 
 
+const void *MP4D_read_vps(const MP4D_demux_t *mp4, unsigned int ntrack, int nsps, int *sps_bytes)
+{
+    return MP4D_read_vpsspspps(mp4, ntrack, 'v', nsps, sps_bytes);
+}
+
 const void *MP4D_read_sps(const MP4D_demux_t *mp4, unsigned int ntrack, int nsps, int *sps_bytes)
 {
-    return MP4D_read_spspps(mp4, ntrack, 0, nsps, sps_bytes);
+    return MP4D_read_vpsspspps(mp4, ntrack, 's', nsps, sps_bytes);
 }
 
 const void *MP4D_read_pps(const MP4D_demux_t *mp4, unsigned int ntrack, int npps, int *pps_bytes)
 {
-    return MP4D_read_spspps(mp4, ntrack, 1, npps, pps_bytes);
+    return MP4D_read_vpsspspps(mp4, ntrack, 'p', npps, pps_bytes);
 }
 
 #if MP4D_PRINT_INFO_SUPPORTED
